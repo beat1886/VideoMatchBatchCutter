@@ -106,17 +106,14 @@ def check_gpu_availability():
         return False
 
 
-def convert_and_cut_ffmpeg(input_path, output_path, cut_time):
+def convert_and_cut_ffmpeg(input_path, output_path, cut_time, use_gpu):
     """
     使用 FFmpeg 将视频转码为 H.264 并在指定时间裁剪，同时彻底清洗元信息。
-    优先使用 GPU 加速。
+    根据传入的 use_gpu 参数决定使用 GPU 还是 CPU 编码。
     """
 
-    # 1. 检查 GPU 是否可用
-    use_gpu = check_gpu_availability()
-
     if use_gpu:
-        print(f"🚀 检测到 NVIDIA GPU，正在启用硬件加速 (h264_nvenc)...")
+        print(f"🚀 正在使用硬件加速 (h264_nvenc)...")
         # GPU 编码参数
         # -cq 21: 相当于 CPU 模式的 CRF 23，数值越小画质越好，文件越大
         # -preset p1: NVENC 的最快速度预设 (p1 到 p7)
@@ -136,7 +133,7 @@ def convert_and_cut_ffmpeg(input_path, output_path, cut_time):
             output_path
         ]
     else:
-        print(f"⚠️ 未检测到 GPU 支持，回退到 CPU 编码 (libx264)...")
+        print(f"ℹ️ 正在使用 CPU 编码 (libx264)...")
         # CPU 编码参数 (备用方案)
         cmd = [
             'ffmpeg',
@@ -169,7 +166,7 @@ def convert_and_cut_ffmpeg(input_path, output_path, cut_time):
             print(f"🎉 处理完成: {output_path}")
             return True
         else:
-            # 如果是 GPU 模式失败，可能是显存不足或其他问题，可以尝试提示用户
+            # 如果是 GPU 模式失败，可以给出更具体的提示
             if use_gpu and "nvenc" in result.stderr.lower():
                 print(f"❌ GPU 编码失败，建议检查显卡驱动或显存。错误信息: {result.stderr[:200]}...")
             else:
@@ -206,6 +203,14 @@ def batch_process(input_dir, output_dir, end_image_path, search_duration=10):
         return
 
     print(f"📂 找到 {len(video_files)} 个视频文件，开始处理...\n")
+    
+    # --- 关键修改：在循环开始前，只检测一次 GPU ---
+    use_gpu = check_gpu_availability()
+    if use_gpu:
+        print("✅ 检测到 NVIDIA GPU，将在处理中使用硬件加速。")
+    else:
+        print("ℹ️ 未检测到 GPU 支持，将使用 CPU 编码。")
+    print("-" * 40)
 
     success_count = 0
     fail_count = 0
@@ -228,7 +233,8 @@ def batch_process(input_dir, output_dir, end_image_path, search_duration=10):
         output_filepath = os.path.join(output_dir, output_filename)
 
         # 3. 执行转码裁剪
-        success = convert_and_cut_ffmpeg(str(video_file), output_filepath, cut_time)
+        # --- 关键修改：将 use_gpu 变量传递给函数 ---
+        success = convert_and_cut_ffmpeg(str(video_file), output_filepath, cut_time, use_gpu)
 
         if success:
             success_count += 1
