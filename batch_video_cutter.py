@@ -15,6 +15,10 @@ END_IMAGE = "end.png"
 SEARCH_TIME = 20
 # ===========================================
 
+def move_cursor_to_top():
+    """将光标移动到控制台最顶部，准备原地刷新"""
+    print("\033[H", end="")
+
 def draw_interface(video_files, results, cpu_processing_set, gpu_processing_set, mode_str, start_time):
     FIXED_VISUAL_WIDTH = 44
     spinners = ['\\', '|', '/', '-']
@@ -41,7 +45,12 @@ def draw_interface(video_files, results, cpu_processing_set, gpu_processing_set,
                     break
                 truncated += c
                 current_len += cl
-            return truncated + "... "
+            # 先截断加省略号
+            s = truncated + "..."
+            # 重点：截断后也强制补空格到固定宽度
+            s_len = get_visual_len(s)
+            pad = FIXED_VISUAL_WIDTH - s_len
+            return s + " " * pad
         else:
             pad = FIXED_VISUAL_WIDTH - v_len
             return name + " " * pad
@@ -49,13 +58,9 @@ def draw_interface(video_files, results, cpu_processing_set, gpu_processing_set,
     total = len(video_files)
     done = len(results)
     percent = int((done / total) * 100) if total > 0 else 0
-    # 仅修改：秒转时分秒
-    cost = int(time.time() - start_time)
-    h = cost // 3600
-    m = (cost % 3600) // 60
-    s = cost % 60
-    time_str = f"{h:02d}:{m:02d}:{s:02d}"
+    elapsed = int(time.time() - start_time)
 
+    move_cursor_to_top()
     print("=" * 85)
     print(f"  视频批量转码裁剪工具 | 模式: {mode_str}")
     print("=" * 85)
@@ -79,8 +84,7 @@ def draw_interface(video_files, results, cpu_processing_set, gpu_processing_set,
     bar_len = 45
     filled = int(bar_len * done // total) if total else 0
     bar = '█' * filled + '-' * (bar_len - filled)
-    # 改用时分秒显示
-    print(f"总进度: |{bar}| {percent}%  已完成 {done}/{total}  耗时 {time_str}")
+    print(f"总进度: |{bar}| {percent}%  已完成 {done}/{total}  耗时 {elapsed}秒")
     print("=" * 85)
     print()
 
@@ -125,8 +129,8 @@ def convert_and_cut_ffmpeg(in_path, out_path, cut_time, use_gpu):
         ]
     else:
         cmd = [
-            'ffmpeg', '-i', in_path, '-to,', str(cut_time),
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+            'ffmpeg', '-i', in_path, '-to', str(cut_time),
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', 23,
             '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-y', out_path
         ]
     try:
@@ -155,31 +159,63 @@ def gpu_worker(result_queue, output_dir, final_results, lock, update_queue):
         out = os.path.join(output_dir, os.path.basename(f))
         if cut_time is None:
             with lock:
-                final_results.append((idx, f, False, "未匹配到片尾"))
+                final_results.append((idx, os.path.basename(f), False, "未匹配到片尾"))
         else:
             ok = convert_and_cut_ffmpeg(f, out, cut_time, use_gpu=True)
             with lock:
-                final_results.append((idx, f, ok, f"裁剪至 {cut_time:.2f}s"))
+                final_results.append((idx, os.path.basename(f), ok, f"裁剪至 {cut_time:.2f}s"))
         update_queue.put(("gpu_end", idx))
 
+def process_single_video(args):
+    index, video_file, output_dir, end_image_path, search_duration, use_gpu = args
+    cut_time = find_timestamp_in_video(str(video_file), end_image_path, search_duration)
+    if cut_time is None:
+        return (index, video_file.name, False, "未找到结束标志(阈值0.85)")
+    output_filepath = os.path.join(output_dir, video_file.name)
+    success = convert_and_cut_ffmpeg(str(video_file), output_filepath, cut_time, use_gpu)
+    if success:
+        return (index, video_file.name, True, f"裁剪至 {cut_time:.2f}s")
+    else:
+        return (index, video_file.name, False, "FFmpeg 转码失败")
+
 def batch_process(input_dir, output_dir, end_image_path, search_duration, mode):
-    exts = ['.mp4', '.avi', '.mov', '.mkv', '.flv']
-    files = sorted([str(f) for f in Path(input_dir).iterdir() if f.suffix.lower() in exts])
-    if not files:
-        print("未找到视频")
+    if not os.path.exists(input_dir):
+        print("❌ 输入文件夹不存在！")
+        return
+    os.makedirs(output_dir, exist_ok=True)
+
+    extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.mpeg', '.mpg']
+    video_files = [f for f in Path(input_dir).iterdir() if f.suffix.lower() in extensions and f.is_file()]
+    video_files.sort()
+    if not video_files:
+        print("⚠️ 无视频文件")
         return
 
     start_time = time.time()
-    mgr = multiprocessing.Manager()
-    results = mgr.list()
-    cpu_proc = mgr.list()
-    gpu_proc = mgr.list()
-    update_queue = Queue()
+    final_results = []
 
-    if mode == 3:
+    # 1 - CPU 多核并行
+    if mode == 1:
+        processes = min(multiprocessing.cpu_count(), len(video_files))
+        use_gpu = False
+        mode_str = f"CPU 多核并行 ({processes}进程)"
+        tasks = [(i, f, output_dir, end_image_path, search_duration, use_gpu) for i, f in enumerate(video_files)]
+        with multiprocessing.Pool(processes=processes) as pool:
+            for _, res in enumerate(pool.imap(process_single_video, tasks, chunksize=1)):
+                final_results.append(res)
+
+    # 2 - GPU 硬件加速
+    elif mode == 2:
+        files = [str(f) for f in video_files]
+        mgr = multiprocessing.Manager()
+        results = mgr.list()
+        cpu_proc = mgr.list()
+        gpu_proc = mgr.list()
+        update_queue = Queue()
+
         cpu_n = 6
         gpu_n = 2
-        mode_str = f"CPU+GPU流水线 (CPU:{cpu_n}核 + GPU:{gpu_n}进程)"
+        mode_str = f"GPU 硬件加速流水线 (CPU:{cpu_n} + GPU:{gpu_n})"
 
         task_queue = Queue()
         result_queue = Queue()
@@ -200,7 +236,6 @@ def batch_process(input_dir, output_dir, end_image_path, search_duration, mode):
         for i in range(len(files)):
             task_queue.put((i, files[i]))
 
-        draw_interface(files, results, cpu_proc, gpu_proc, mode_str, start_time)
         while len(results) < len(files):
             updated = False
             while not update_queue.empty():
@@ -215,31 +250,131 @@ def batch_process(input_dir, output_dir, end_image_path, search_duration, mode):
                     gpu_proc.remove(idx)
                 updated = True
             if updated:
-                draw_interface(files, results, cpu_proc, gpu_proc, mode_str, start_time)
+                draw_interface(video_files, results, cpu_proc, gpu_proc, mode_str, start_time)
             time.sleep(0.1)
 
         for _ in cpu_list: task_queue.put(None)
         for _ in gpu_list: result_queue.put(None)
         for p in cpu_list: p.join()
         for p in gpu_list: p.join()
+        final_results = list(results)
 
-    draw_interface(files, results, cpu_proc, gpu_proc, mode_str, start_time)
+    # 3 - CPU+GPU 流水线
+    elif mode == 3:
+        files = [str(f) for f in video_files]
+        mgr = multiprocessing.Manager()
+        results = mgr.list()
+        cpu_proc = mgr.list()
+        gpu_proc = mgr.list()
+        update_queue = Queue()
+
+        cpu_n = 6
+        gpu_n = 2
+        mode_str = f"CPU+GPU 流水线 (CPU:{cpu_n}核 + GPU:{gpu_n}进程)"
+
+        task_queue = Queue()
+        result_queue = Queue()
+
+        cpu_list = []
+        for _ in range(cpu_n):
+            p = multiprocessing.Process(target=cpu_worker, args=(task_queue, result_queue, update_queue, end_image_path, search_duration))
+            cpu_list.append(p)
+            p.start()
+
+        gpu_list = []
+        lock = mgr.Lock()
+        for _ in range(gpu_n):
+            p = multiprocessing.Process(target=gpu_worker, args=(result_queue, output_dir, results, lock, update_queue))
+            gpu_list.append(p)
+            p.start()
+
+        for i in range(len(files)):
+            task_queue.put((i, files[i]))
+
+        while len(results) < len(files):
+            updated = False
+            while not update_queue.empty():
+                t, idx = update_queue.get()
+                if t == "cpu_start" and idx not in cpu_proc:
+                    cpu_proc.append(idx)
+                elif t == "cpu_end" and idx in cpu_proc:
+                    cpu_proc.remove(idx)
+                elif t == "gpu_start" and idx not in gpu_proc:
+                    gpu_proc.append(idx)
+                elif t == "gpu_end" and idx in gpu_proc:
+                    gpu_proc.remove(idx)
+                updated = True
+            if updated:
+                draw_interface(video_files, results, cpu_proc, gpu_proc, mode_str, start_time)
+            time.sleep(0.1)
+
+        for _ in cpu_list: task_queue.put(None)
+        for _ in gpu_list: result_queue.put(None)
+        for p in cpu_list: p.join()
+        for p in gpu_list: p.join()
+        final_results = list(results)
+
+    # 4 - CPU 单核调试
+    elif mode == 4:
+        mode_str = "CPU 单核调试"
+        use_gpu = False
+        tasks = [(i, f, output_dir, end_image_path, search_duration, use_gpu) for i, f in enumerate(video_files)]
+        for task in tasks:
+            res = process_single_video(task)
+            final_results.append(res)
+
+    # 最终报告
+    print("\n" * 5)
+    print("=" * 70)
+    print("📊 处理结果最终报告 (按文件顺序排列)")
+    print("=" * 70)
+
+    success_count = 0
+    for index, filename, success, msg in final_results:
+        status_icon = "✅" if success else "❌"
+        print(f"{status_icon} [{index+1:02d}] {filename:<35} | {msg}")
+        if success:
+            success_count += 1
+
+    print("=" * 70)
+    print(f"🏁 全部任务结束 | 成功: {success_count} / 总数: {len(video_files)}")
 
 def main():
-    print("============================================================")
-    print("            视频批量转码裁剪工具")
-    print("============================================================")
-    print(" 1 - CPU 多核并行")
-    print(" 2 - GPU 硬件加速")
-    print(" 3 - CPU+GPU 流水线（分别并行处理）")
-    print(" 4 - CPU 单核调试")
-    print("============================================================")
-    c = input("请选择模式 [1/2/3/4]，默认3：").strip()
-    mode = 3
-    if c == "1": mode = 1
-    elif c == "2": mode = 2
-    elif c == "4": mode = 4
-    batch_process(INPUT_DIR, OUTPUT_DIR, END_IMAGE, SEARCH_TIME, mode)
+    """主程序入口"""
+    try:
+        # 检查 FFmpeg
+        try:
+            subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            print("❌ 未找到 FFmpeg，请确保已添加到环境变量")
+            input("\n程序出现错误，按回车键退出...")
+            sys.exit(1)
+
+        # 4个选项菜单
+        print("============================================================")
+        print("            视频批量转码裁剪工具")
+        print("============================================================")
+        print(" 1 - CPU 多核并行")
+        print(" 2 - GPU 硬件加速")
+        print(" 3 - CPU+GPU 流水线（分别并行处理）")
+        print(" 4 - CPU 单核调试")
+        print("============================================================")
+        choice = input("请选择模式 [1/2/3/4]，默认3：").strip()
+
+        run_mode = 3
+        if choice == "1":
+            run_mode = 1
+        elif choice == "2":
+            run_mode = 2
+        elif choice == "4":
+            run_mode = 4
+
+        batch_process(INPUT_DIR, OUTPUT_DIR, END_IMAGE, SEARCH_TIME, run_mode)
+
+    except Exception as e:
+        print(f"\n❌ 程序运行出错：{e}")
+
+    input("\n任务结束，按回车键退出...")
 
 if __name__ == "__main__":
     main()
